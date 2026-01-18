@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Shell / OS
+.zshrc
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data / outputs
+*.csv
