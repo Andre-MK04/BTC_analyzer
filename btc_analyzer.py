@@ -585,6 +585,8 @@ def compute_signal_for_last_day(
     mtf_trends: Optional[Dict[str, str]] = None,
     atr_pct_min: Optional[float] = None,
     atr_pct_max: Optional[float] = None,
+    fib_tp_wiggle: float = 0.98,
+    fib_stop_wiggle: float = 0.99,
 ) -> SignalOutput:
     last = df_ind.iloc[-1]
     date = df_ind.index[-1]
@@ -690,9 +692,10 @@ def compute_signal_for_last_day(
     # Volatility / risk-adjust
     atr = _scalar(last.get("ATR14", np.nan))
     levels = {}
+    direction = "LONG" if score > 0 else "SHORT"
     if not np.isnan(atr):
-        levels["stop_atr_1x"] = close - atr if score > 0 else close + atr
-        levels["tp_atr_2x"] = close + 2 * atr if score > 0 else close - 2 * atr
+        levels["stop_atr_1x"] = close - atr if direction == "LONG" else close + atr
+        levels["tp_atr_2x"] = close + 2 * atr if direction == "LONG" else close - 2 * atr
 
     # Decide action
     T = 0.45 if reg == "trending" else 0.55  # stricter in ranging markets
@@ -731,6 +734,40 @@ def compute_signal_for_last_day(
         last_pattern_date = last_bfly_date
     elif last_chart_date:
         last_pattern_date = last_chart_date
+
+    if action in ("LONG", "SHORT") and swings:
+        recent_swings = swings[-6:] if len(swings) >= 6 else swings
+        highs = [s.price for s in recent_swings if s.kind == "H"]
+        lows = [s.price for s in recent_swings if s.kind == "L"]
+        if highs and lows:
+            swing_high = max(highs)
+            swing_low = min(lows)
+            swing_range = swing_high - swing_low
+            if swing_range > 0:
+                if action == "LONG":
+                    fib_stop = swing_low - 0.236 * swing_range
+                    fib_tp = swing_low + 1.272 * swing_range
+                    levels["stop_fib"] = fib_stop * fib_stop_wiggle
+                    levels["tp_fib"] = fib_tp * fib_tp_wiggle
+                else:
+                    fib_stop = swing_high + 0.236 * swing_range
+                    fib_tp = swing_high - 1.272 * swing_range
+                    levels["stop_fib"] = fib_stop * (2.0 - fib_stop_wiggle)
+                    levels["tp_fib"] = fib_tp * (2.0 - fib_tp_wiggle)
+
+        ma_candidates = [ema50, ema200]
+        if action == "LONG":
+            ma_stop = min(ma_candidates)
+            ma_tp_candidates = [ma for ma in ma_candidates if ma > close]
+            ma_tp = min(ma_tp_candidates) if ma_tp_candidates else None
+        else:
+            ma_stop = max(ma_candidates)
+            ma_tp_candidates = [ma for ma in ma_candidates if ma < close]
+            ma_tp = max(ma_tp_candidates) if ma_tp_candidates else None
+        if not np.isnan(ma_stop):
+            levels["stop_ma"] = float(ma_stop)
+        if ma_tp is not None:
+            levels["tp_ma"] = float(ma_tp)
     return SignalOutput(
         date=date,
         action=action,
