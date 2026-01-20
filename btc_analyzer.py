@@ -43,6 +43,94 @@ def fetch_btc_usd_daily(
     return df
 
 
+def fetch_btc_usd_interval(
+    interval: str,
+    period: str,
+) -> pd.DataFrame:
+    ticker = "BTC-USD"
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+    if df.empty:
+        raise RuntimeError(f"No data returned for interval={interval}.")
+    df = df.rename(columns=str.title)
+    keep = ["Open", "High", "Low", "Close", "Volume"]
+    df = df[keep].copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.dropna()
+    return df
+
+
+def _ema_trend_from_close(close: pd.Series) -> str:
+    close = close.dropna()
+    if len(close) < 210:
+        return "neutral"
+    ema50 = EMAIndicator(close, window=50).ema_indicator().iloc[-1]
+    ema200 = EMAIndicator(close, window=200).ema_indicator().iloc[-1]
+    last_close = close.iloc[-1]
+    if last_close > ema50 > ema200:
+        return "up"
+    if last_close < ema50 < ema200:
+        return "down"
+    return "neutral"
+
+
+def get_mtf_trends() -> Dict[str, str]:
+    data_1h = fetch_btc_usd_interval("1h", "730d")
+    data_4h = fetch_btc_usd_interval("4h", "730d")
+    data_1w = fetch_btc_usd_interval("1wk", "10y")
+    return {
+        "1h": _ema_trend_from_close(data_1h["Close"]),
+        "4h": _ema_trend_from_close(data_4h["Close"]),
+        "1w": _ema_trend_from_close(data_1w["Close"]),
+    }
+
+
+def _fit_logistic(scores: np.ndarray, outcomes: np.ndarray) -> Tuple[float, float]:
+    a = 1.0
+    b = 0.0
+    lr = 0.05
+    for _ in range(3000):
+        z = a * scores + b
+        p = 1.0 / (1.0 + np.exp(-z))
+        grad_a = np.mean((p - outcomes) * scores)
+        grad_b = np.mean(p - outcomes)
+        a -= lr * grad_a
+        b -= lr * grad_b
+    return float(a), float(b)
+
+
+def build_confidence_calibrator(
+    df_ind: pd.DataFrame,
+    atr_mult: float = 2.0,
+    start_index: int = 250,
+    max_samples: int = 1200,
+) -> Tuple[float, float]:
+    def _scalar(x):
+        if isinstance(x, pd.Series):
+            return float(x.iloc[0])
+        if isinstance(x, np.ndarray):
+            return float(x.reshape(-1)[0])
+        return float(x)
+
+    scores: List[float] = []
+    outcomes: List[int] = []
+    df = df_ind.dropna().copy()
+    end_index = min(len(df) - 2, start_index + max_samples)
+    for i in range(start_index, end_index):
+        hist = df.iloc[: i + 1].copy()
+        swings = zigzag_swings(hist["Close"], hist["ATR14"], atr_mult=atr_mult)
+        sig = compute_signal_for_last_day(hist, swings, confidence_calibrator=None, mtf_trends=None)
+        next_ret = _scalar(df["Close"].iloc[i + 1] / df["Close"].iloc[i] - 1.0)
+        if sig.score == 0:
+            continue
+        correct = 1 if (sig.score > 0 and next_ret > 0) or (sig.score < 0 and next_ret < 0) else 0
+        scores.append(abs(sig.score))
+        outcomes.append(correct)
+
+    if len(scores) < 50:
+        return 1.0, 0.0
+    return _fit_logistic(np.array(scores, dtype=float), np.array(outcomes, dtype=float))
+
+
 # -----------------------------
 # Indicators (broad set)
 # -----------------------------
@@ -460,6 +548,12 @@ class SignalOutput:
     score: float
     reasons: List[str]
     levels: Dict[str, float]
+    close: float
+    atr: float
+    atr_pct: float
+    threshold: float
+    score_breakdown: Dict[str, float]
+    last_pattern_date: Optional[pd.Timestamp]
 
 
 def regime_filter(row: pd.Series) -> str:
@@ -484,7 +578,14 @@ def regime_filter(row: pd.Series) -> str:
     return "ranging"
 
 
-def compute_signal_for_last_day(df_ind: pd.DataFrame, swings: List[SwingPoint]) -> SignalOutput:
+def compute_signal_for_last_day(
+    df_ind: pd.DataFrame,
+    swings: List[SwingPoint],
+    confidence_calibrator: Optional[Tuple[float, float]] = None,
+    mtf_trends: Optional[Dict[str, str]] = None,
+    atr_pct_min: Optional[float] = None,
+    atr_pct_max: Optional[float] = None,
+) -> SignalOutput:
     last = df_ind.iloc[-1]
     date = df_ind.index[-1]
     def _scalar(x):
@@ -501,29 +602,39 @@ def compute_signal_for_last_day(df_ind: pd.DataFrame, swings: List[SwingPoint]) 
 
     reasons: List[str] = []
     score = 0.0
+    breakdown: Dict[str, float] = {}
 
     # Trend score
+    trend_score = 0.0
     if close > ema50 > ema200:
-        score += 0.6
+        trend_score = 0.6
         reasons.append("Uptrend (Close > EMA50 > EMA200)")
     elif close < ema50 < ema200:
-        score -= 0.6
+        trend_score = -0.6
         reasons.append("Downtrend (Close < EMA50 < EMA200)")
+    score += trend_score
+    breakdown["trend"] = trend_score
 
     # Momentum score
+    rsi_score = 0.0
     rsi = _scalar(last.get("RSI14", np.nan))
     if not np.isnan(rsi):
         if rsi <= 30:
-            score += 0.25
+            rsi_score = 0.25
             reasons.append(f"RSI oversold ({rsi:.1f})")
         elif rsi >= 70:
-            score -= 0.25
+            rsi_score = -0.25
             reasons.append(f"RSI overbought ({rsi:.1f})")
+    score += rsi_score
+    breakdown["rsi"] = rsi_score
 
+    macd_score = 0.0
     macdh = _scalar(last.get("MACDh_12_26_9", np.nan))
     if not np.isnan(macdh):
-        score += 0.15 if macdh > 0 else -0.15
+        macd_score = 0.15 if macdh > 0 else -0.15
         reasons.append(f"MACD histogram {'positive' if macdh>0 else 'negative'}")
+    score += macd_score
+    breakdown["macd_hist"] = macd_score
 
     # Regime
     reg = regime_filter(last)
@@ -531,38 +642,50 @@ def compute_signal_for_last_day(df_ind: pd.DataFrame, swings: List[SwingPoint]) 
 
     # Elliott
     e = elliott_impulse_vs_correction(swings)
-    score += (e.impulse_prob - 0.5) * 0.35
+    elliott_score = (e.impulse_prob - 0.5) * 0.35
+    score += elliott_score
+    breakdown["elliott"] = elliott_score
     reasons.append(f"Elliott heuristic: impulse={e.impulse_prob:.2f} ({e.note})")
 
     # Harmonics (use most recent completed butterfly if near end)
     butterflies = find_butterfly_patterns(swings, tol=0.08)
     recent_bfly = None
+    bfly_score = 0.0
+    last_bfly_date = None
     if butterflies:
         # pick the last by D date
         recent_bfly = sorted(butterflies, key=lambda p: p.points["D"][0])[-1]
         d_date, d_price = recent_bfly.points["D"]
+        last_bfly_date = d_date
         # if D is within last ~45 days, consider it relevant
         if (date - d_date).days <= 45:
             dist = abs(close - d_price) / close
             if dist <= 0.06:  # within 6% of PRZ point
                 boost = 0.45 * recent_bfly.quality
                 if recent_bfly.direction == "bullish":
-                    score += boost
+                    bfly_score += boost
                     reasons.append(f"Bullish Butterfly nearby (q={recent_bfly.quality:.2f})")
                 else:
-                    score -= boost
+                    bfly_score -= boost
                     reasons.append(f"Bearish Butterfly nearby (q={recent_bfly.quality:.2f})")
+    score += bfly_score
+    breakdown["butterfly"] = bfly_score
 
     # Chart patterns (recent)
     patterns = []
     patterns += detect_double_top_bottom(swings, pct_tol=0.03)
     patterns += detect_head_and_shoulders(swings, pct_tol=0.05)
+    chart_score = 0.0
+    last_chart_date = None
     if patterns:
         recent = sorted(patterns, key=lambda p: p.idx)[-1]
+        last_chart_date = recent.idx
         if (date - recent.idx).days <= 60:
             adj = 0.35 * recent.strength
-            score += adj if recent.direction == "bullish" else -adj
+            chart_score += adj if recent.direction == "bullish" else -adj
             reasons.append(f"{recent.name} detected (strength={recent.strength:.2f})")
+    score += chart_score
+    breakdown["chart_patterns"] = chart_score
 
     # Volatility / risk-adjust
     atr = _scalar(last.get("ATR14", np.nan))
@@ -580,23 +703,87 @@ def compute_signal_for_last_day(df_ind: pd.DataFrame, swings: List[SwingPoint]) 
     else:
         action = "NO TRADE"
 
-    confidence = float(np.clip(abs(score) / 1.2, 0, 1))
-    return SignalOutput(date=date, action=action, confidence=confidence, score=float(score), reasons=reasons, levels=levels)
+    atr_pct = (atr / close * 100.0) if not np.isnan(atr) and close != 0 else np.nan
+    if not np.isnan(atr_pct):
+        if atr_pct_min is not None and atr_pct < atr_pct_min:
+            reasons.append(f"ATR% too low ({atr_pct:.2f}%) -> NO TRADE")
+            action = "NO TRADE"
+        if atr_pct_max is not None and atr_pct > atr_pct_max:
+            reasons.append(f"ATR% too high ({atr_pct:.2f}%) -> NO TRADE")
+            action = "NO TRADE"
+
+    if mtf_trends and action in ("LONG", "SHORT"):
+        expected = "up" if action == "LONG" else "down"
+        mismatched = [k for k, v in mtf_trends.items() if v != expected]
+        if mismatched:
+            reasons.append(f"MTF trend mismatch ({', '.join(mismatched)}) -> NO TRADE")
+            action = "NO TRADE"
+
+    if confidence_calibrator:
+        a, b = confidence_calibrator
+        confidence = float(1.0 / (1.0 + np.exp(-(a * abs(score) + b))))
+    else:
+        confidence = float(np.clip(abs(score) / 1.2, 0, 1))
+    last_pattern_date = None
+    if last_bfly_date and last_chart_date:
+        last_pattern_date = max(last_bfly_date, last_chart_date)
+    elif last_bfly_date:
+        last_pattern_date = last_bfly_date
+    elif last_chart_date:
+        last_pattern_date = last_chart_date
+    return SignalOutput(
+        date=date,
+        action=action,
+        confidence=confidence,
+        score=float(score),
+        reasons=reasons,
+        levels=levels,
+        close=float(close),
+        atr=float(atr) if not np.isnan(atr) else np.nan,
+        atr_pct=float(atr_pct) if not np.isnan(atr_pct) else np.nan,
+        threshold=float(T),
+        score_breakdown=breakdown,
+        last_pattern_date=last_pattern_date,
+    )
 
 
-def _format_signal_email(sig: SignalOutput) -> Tuple[str, str]:
+def _format_signal_email(
+    sig: SignalOutput,
+    extra_sections: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[str, str]:
     subject = f"BTC Signal for {sig.date.date()}: {sig.action} (conf {sig.confidence:.2f})"
     lines = [
         "BTC next-day signal",
         f"Date:       {sig.date.date()}",
+        f"Close:      {sig.close:.2f}",
         f"Action:     {sig.action}",
         f"Score:      {sig.score:.3f}",
+        f"Threshold:  {sig.threshold:.2f}",
         f"Confidence: {sig.confidence:.2f}",
     ]
+    if not np.isnan(sig.atr):
+        atr_pct = f"{sig.atr_pct:.2f}%" if not np.isnan(sig.atr_pct) else "n/a"
+        lines.append(f"ATR14:      {sig.atr:.2f} ({atr_pct})")
     if sig.levels:
         lines.append("Levels:")
         for k, v in sig.levels.items():
             lines.append(f"  - {k}: {v:.2f}")
+    if sig.score_breakdown:
+        lines.append("Score breakdown:")
+        for k, v in sig.score_breakdown.items():
+            lines.append(f"  - {k}: {v:+.3f}")
+    if sig.last_pattern_date:
+        days_ago = (sig.date - sig.last_pattern_date).days
+        lines.append(f"Last pattern: {sig.last_pattern_date.date()} ({days_ago} days ago)")
+    else:
+        lines.append("Last pattern: none found")
+    if extra_sections:
+        for title, section_lines in extra_sections.items():
+            if not section_lines:
+                continue
+            lines.append(f"{title}:")
+            for line in section_lines:
+                lines.append(f"  - {line}")
     if sig.reasons:
         lines.append("Reasons:")
         for r in sig.reasons:
@@ -605,7 +792,10 @@ def _format_signal_email(sig: SignalOutput) -> Tuple[str, str]:
     return subject, body
 
 
-def send_email_notification(sig: SignalOutput) -> None:
+def send_email_notification(
+    sig: SignalOutput,
+    extra_sections: Optional[Dict[str, List[str]]] = None,
+) -> None:
     recipients = [e.strip() for e in os.getenv("BTC_NOTIFY_EMAILS", "").split(",") if e.strip()]
     if not recipients:
         return
@@ -619,7 +809,7 @@ def send_email_notification(sig: SignalOutput) -> None:
     if not (smtp_host and smtp_user and smtp_password and sender):
         raise RuntimeError("Email enabled but SMTP settings are missing.")
 
-    subject, body = _format_signal_email(sig)
+    subject, body = _format_signal_email(sig, extra_sections=extra_sections)
     message = f"Subject: {subject}\nFrom: {sender}\nTo: {', '.join(recipients)}\n\n{body}"
 
     with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
@@ -635,6 +825,8 @@ def walk_forward_backtest(
     atr_mult: float = 2.0,
     start_year: int = 2016,
     fee_bps: float = 10.0,  # 10 bps = 0.10% round-trip rough placeholder
+    atr_pct_min: Optional[float] = None,
+    atr_pct_max: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Baseline backtest:
@@ -649,13 +841,24 @@ def walk_forward_backtest(
 
     results = []
     fee = fee_bps / 10000.0
+    def _scalar(x):
+        if isinstance(x, pd.Series):
+            return float(x.iloc[0])
+        if isinstance(x, np.ndarray):
+            return float(x.reshape(-1)[0])
+        return float(x)
 
     for i in range(250, len(df) - 1):
         hist = df.iloc[: i + 1].copy()
         swings = zigzag_swings(hist["Close"], hist["ATR14"], atr_mult=atr_mult)
-        sig = compute_signal_for_last_day(hist, swings)
+        sig = compute_signal_for_last_day(
+            hist,
+            swings,
+            atr_pct_min=atr_pct_min,
+            atr_pct_max=atr_pct_max,
+        )
 
-        next_ret = float(df["Close"].iloc[i + 1] / df["Close"].iloc[i] - 1.0)
+        next_ret = _scalar(df["Close"].iloc[i + 1] / df["Close"].iloc[i] - 1.0)
         pos = 0
         if sig.action == "LONG":
             pos = 1
@@ -681,6 +884,45 @@ def walk_forward_backtest(
     return res
 
 
+def optimize_atr_params(
+    df_ind: pd.DataFrame,
+    atr_mult_grid: List[float],
+    atr_pct_min_grid: List[Optional[float]],
+    atr_pct_max_grid: List[Optional[float]],
+    start_year: int = 2016,
+    fee_bps: float = 10.0,
+) -> pd.DataFrame:
+    rows = []
+    for atr_mult in atr_mult_grid:
+        for atr_pct_min in atr_pct_min_grid:
+            for atr_pct_max in atr_pct_max_grid:
+                if atr_pct_min is not None and atr_pct_max is not None and atr_pct_min >= atr_pct_max:
+                    continue
+                bt = walk_forward_backtest(
+                    df_ind,
+                    atr_mult=atr_mult,
+                    start_year=start_year,
+                    fee_bps=fee_bps,
+                    atr_pct_min=atr_pct_min,
+                    atr_pct_max=atr_pct_max,
+                )
+                total_return = float(bt["Equity"].iloc[-1] - 1.0)
+                max_dd = float((bt["Equity"] / bt["Equity"].cummax() - 1.0).min())
+                hit_rate = float((bt["StrategyReturn"] > 0).mean())
+                trades = int((bt["Action"] != "NO TRADE").sum())
+                rows.append({
+                    "atr_mult": atr_mult,
+                    "atr_pct_min": atr_pct_min,
+                    "atr_pct_max": atr_pct_max,
+                    "total_return": total_return,
+                    "max_drawdown": max_dd,
+                    "hit_rate": hit_rate,
+                    "trades": trades,
+                })
+    res = pd.DataFrame(rows)
+    return res.sort_values(["total_return", "hit_rate"], ascending=[False, False]).reset_index(drop=True)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -690,7 +932,17 @@ def main():
 
     # swings on full history for pattern mining
     swings = zigzag_swings(df_ind["Close"], df_ind["ATR14"], atr_mult=2.0)
-    sig = compute_signal_for_last_day(df_ind, swings)
+    confidence_calibrator = build_confidence_calibrator(df_ind, atr_mult=2.0)
+    try:
+        mtf_trends = get_mtf_trends()
+    except Exception:
+        mtf_trends = None
+    sig = compute_signal_for_last_day(
+        df_ind,
+        swings,
+        confidence_calibrator=confidence_calibrator,
+        mtf_trends=mtf_trends,
+    )
     send_email_notification(sig)
 
     print("\n=== NEXT-DAY SIGNAL (research) ===")
@@ -741,7 +993,21 @@ def main():
     bt.to_csv("backtest_results.csv")
     print("\nSaved: backtest_results.csv")
 
+    if os.getenv("OPTIMIZE_ATR", ""):
+        print("\n=== OPTIMIZE ATR PARAMS ===")
+        atr_mult_grid = [round(x, 2) for x in np.arange(1.0, 3.25, 0.25)]
+        atr_pct_min_grid = [None, 1.0, 1.5, 2.0]
+        atr_pct_max_grid = [None, 8.0, 10.0, 12.0]
+        opt = optimize_atr_params(
+            df_ind,
+            atr_mult_grid=atr_mult_grid,
+            atr_pct_min_grid=atr_pct_min_grid,
+            atr_pct_max_grid=atr_pct_max_grid,
+            start_year=2016,
+            fee_bps=10.0,
+        )
+        print(opt.head(10).to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
-

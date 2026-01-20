@@ -5,7 +5,10 @@ from btc_analyzer import (
     fetch_btc_usd_daily,
     add_indicators,
     zigzag_swings,
-    compute_signal_for_last_day
+    compute_signal_for_last_day,
+    build_confidence_calibrator,
+    get_mtf_trends,
+    send_email_notification,
 )
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -25,11 +28,16 @@ def forward_simulate(
     risk_per_trade=0.01,
     confidence_threshold=0.5,
     fee=0.001,  # 0.1%
-    max_hold_days=5
+    max_hold_days=5,
+    send_email: bool = False,
 ):
-    df = fetch_btc_usd_daily(start="2014-01-01")
-    df = add_indicators(df)
-    df = df[df.index >= start_date].copy()
+    df_full = fetch_btc_usd_daily(start="2014-01-01")
+    df_full = add_indicators(df_full)
+    df = df_full[df_full.index >= start_date].copy()
+    calibrator_df = df_full[df_full.index < start_date]
+    confidence_calibrator = build_confidence_calibrator(
+        calibrator_df if len(calibrator_df) >= 400 else df_full
+    )
 
     capital = 1.0
     open_trade = None
@@ -45,7 +53,11 @@ def forward_simulate(
 
         # Compute today's signal (based only on history up to today)
         swings = zigzag_swings(today_hist["Close"], today_hist["ATR14"])
-        sig = compute_signal_for_last_day(today_hist, swings)
+        sig = compute_signal_for_last_day(
+            today_hist,
+            swings,
+            confidence_calibrator=confidence_calibrator,
+        )
 
         # --- Manage open trade on "tomorrow close" (simple model) ---
         realized_today = 0.0
@@ -53,7 +65,9 @@ def forward_simulate(
 
         if open_trade is not None:
             open_trade["days"] += 1
-            price = float(tomorrow_row["Close"])
+            close_price = float(tomorrow_row["Close"])
+            high_price = float(tomorrow_row["High"])
+            low_price = float(tomorrow_row["Low"])
 
             def close_trade(exit_price: float):
                 nonlocal capital, trade_count, win_count, last_trade_pnl, realized_today, closed_today, open_trade
@@ -79,17 +93,21 @@ def forward_simulate(
                 closed_today = True
                 open_trade = None
 
-            # Stop/Target checks (using close-to-close approximation)
+            # Stop/Target checks (use next-day high/low)
             if open_trade["direction"] == "LONG":
-                if price <= open_trade["stop"] or price >= open_trade["target"]:
-                    close_trade(price)
+                if low_price <= open_trade["stop"]:
+                    close_trade(float(open_trade["stop"]))
+                elif high_price >= open_trade["target"]:
+                    close_trade(float(open_trade["target"]))
             else:  # SHORT
-                if price >= open_trade["stop"] or price <= open_trade["target"]:
-                    close_trade(price)
+                if high_price >= open_trade["stop"]:
+                    close_trade(float(open_trade["stop"]))
+                elif low_price <= open_trade["target"]:
+                    close_trade(float(open_trade["target"]))
 
             # Time stop
             if open_trade is not None and open_trade["days"] >= max_hold_days:
-                close_trade(float(tomorrow_row["Close"]))
+                close_trade(close_price)
 
         # --- Open new trade for tomorrow if none open ---
         opened_today = False
@@ -156,13 +174,41 @@ def forward_simulate(
         print("Open trade:      NO")
     print("=================================================\n")
 
+    if send_email:
+        swings = zigzag_swings(df["Close"], df["ATR14"])
+        try:
+            mtf_trends = get_mtf_trends()
+        except Exception:
+            mtf_trends = None
+        sig = compute_signal_for_last_day(
+            df,
+            swings,
+            confidence_calibrator=confidence_calibrator,
+            mtf_trends=mtf_trends,
+        )
+        last7 = res.tail(7)
+        last7_lines = [
+            f"{idx.date()}: {row['SignalToday']} (score={row['Score']:.3f}, conf={row['Confidence']:.2f})"
+            for idx, row in last7.iterrows()
+        ]
+        extra_sections = {
+            "Performance": [
+                f"Total return since start: {fmt_pct(total_ret)}",
+                f"Max drawdown: {fmt_pct(mdd)}",
+                f"Trades: {trade_count} | Win rate: {win_rate*100:.1f}%",
+            ],
+            "Last 7 days actions": last7_lines,
+        }
+        send_email_notification(sig, extra_sections=extra_sections)
+
     return res
 
 
 if __name__ == "__main__":
     equity = forward_simulate(
         start_date="2025-01-01",
-        confidence_threshold=0.6
+        confidence_threshold=0.6,
+        send_email=True,
     )
 
     equity.to_csv("forward_simulation.csv")
