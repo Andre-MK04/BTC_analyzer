@@ -554,6 +554,13 @@ class SignalOutput:
     threshold: float
     score_breakdown: Dict[str, float]
     last_pattern_date: Optional[pd.Timestamp]
+    leverage: int
+    tp_price: Optional[float]
+    stop_price: Optional[float]
+    tp_pct: Optional[float]
+    stop_pct: Optional[float]
+    tp_pct_levered: Optional[float]
+    stop_pct_levered: Optional[float]
 
 
 def regime_filter(row: pd.Series) -> str:
@@ -587,6 +594,7 @@ def compute_signal_for_last_day(
     atr_pct_max: Optional[float] = None,
     fib_tp_wiggle: float = 0.98,
     fib_stop_wiggle: float = 0.99,
+    leverage_choices: Tuple[int, ...] = (1, 5, 10),
 ) -> SignalOutput:
     last = df_ind.iloc[-1]
     date = df_ind.index[-1]
@@ -768,6 +776,32 @@ def compute_signal_for_last_day(
             levels["stop_ma"] = float(ma_stop)
         if ma_tp is not None:
             levels["tp_ma"] = float(ma_tp)
+
+    def _choose_level(keys: List[str]) -> Optional[float]:
+        for k in keys:
+            if k in levels and not np.isnan(levels[k]):
+                return float(levels[k])
+        return None
+
+    tp_price = _choose_level(["tp_fib", "tp_ma", "tp_atr_2x"])
+    stop_price = _choose_level(["stop_fib", "stop_ma", "stop_atr_1x"])
+    tp_pct = None
+    stop_pct = None
+    if action in ("LONG", "SHORT") and tp_price and stop_price:
+        tp_pct = abs(tp_price - close) / close * 100.0
+        stop_pct = abs(stop_price - close) / close * 100.0
+
+    leverage = 1
+    if action in ("LONG", "SHORT") and tp_pct is not None and stop_pct is not None:
+        if confidence >= 0.7 and atr_pct is not None and not np.isnan(atr_pct) and atr_pct <= 6.0:
+            leverage = 10 if 10 in leverage_choices else leverage_choices[-1]
+        elif confidence >= 0.55:
+            leverage = 5 if 5 in leverage_choices else leverage_choices[min(1, len(leverage_choices) - 1)]
+        else:
+            leverage = 1
+
+    tp_pct_levered = tp_pct * leverage if tp_pct is not None else None
+    stop_pct_levered = stop_pct * leverage if stop_pct is not None else None
     return SignalOutput(
         date=date,
         action=action,
@@ -781,6 +815,13 @@ def compute_signal_for_last_day(
         threshold=float(T),
         score_breakdown=breakdown,
         last_pattern_date=last_pattern_date,
+        leverage=leverage,
+        tp_price=tp_price,
+        stop_price=stop_price,
+        tp_pct=tp_pct,
+        stop_pct=stop_pct,
+        tp_pct_levered=tp_pct_levered,
+        stop_pct_levered=stop_pct_levered,
     )
 
 
@@ -814,6 +855,14 @@ def _format_signal_email(
         lines.append(f"Last pattern: {sig.last_pattern_date.date()} ({days_ago} days ago)")
     else:
         lines.append("Last pattern: none found")
+    if sig.action in ("LONG", "SHORT") and sig.tp_price and sig.stop_price:
+        tp_pct = f"{sig.tp_pct:.2f}%" if sig.tp_pct is not None else "n/a"
+        stop_pct = f"{sig.stop_pct:.2f}%" if sig.stop_pct is not None else "n/a"
+        tp_pct_lev = f"{sig.tp_pct_levered:.2f}%" if sig.tp_pct_levered is not None else "n/a"
+        stop_pct_lev = f"{sig.stop_pct_levered:.2f}%" if sig.stop_pct_levered is not None else "n/a"
+        lines.append(f"Leverage:  {sig.leverage}x")
+        lines.append(f"TP price:  {sig.tp_price:.2f} ({tp_pct} | {tp_pct_lev} @ {sig.leverage}x)")
+        lines.append(f"Stop:      {sig.stop_price:.2f} ({stop_pct} | {stop_pct_lev} @ {sig.leverage}x)")
     if extra_sections:
         for title, section_lines in extra_sections.items():
             if not section_lines:
